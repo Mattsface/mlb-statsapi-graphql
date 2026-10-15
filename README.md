@@ -78,8 +78,14 @@ The package lives in `src/mlb_statsapi_graphql/`:
   the client and its HTTP connection pool.
 - `context.py` makes that client available to resolvers through request context.
 - `schema.py` defines nullable root `Query.team` and `Query.player` fields.
-- `resolvers.py` asynchronously calls `await info.context.mlb.get_team(id)` and
-  maps the returned library model to the public GraphQL `Team` in `types.py`.
+- `resolvers.py` holds the root resolvers: it validates the ID, asynchronously
+  calls `await info.context.mlb.get_team(id)`, and maps the returned library
+  model to the public GraphQL `Team` in `types.py`.
+- `types.py` defines the GraphQL types, including the lazy `Team.roster` field
+  resolver. `errors.py` holds the shared client-safe errors.
+
+Imports flow one way: `app → schema → resolvers → types → errors/context`.
+`types.py` never imports `resolvers.py`, so there is no circular import.
 
 The installed library's 1.1.2 model was inspected: `id` is required, while `name`
 and `abbreviation` are optional. Its default strict HTTP mode preserves 404 as
@@ -229,3 +235,30 @@ To validate packaging as well as tests:
 ```bash
 uv build
 ```
+
+## M1.1: input validation and errors
+
+`team(id:)` and `player(id:)` require a positive ID. Zero or negative IDs are
+rejected before any upstream request; the field is null and the error has
+`extensions.code: "BAD_USER_INPUT"`:
+
+```json
+{
+  "data": {"team": null},
+  "errors": [{
+    "message": "Argument 'id' must be a positive integer.",
+    "path": ["team"],
+    "extensions": {"code": "BAD_USER_INPUT"}
+  }]
+}
+```
+
+Error codes:
+
+- `BAD_USER_INPUT`: the client sent an invalid argument; fix the request.
+- `UPSTREAM_ERROR`: the MLB service failed or returned unusable data; retry later.
+
+Any other exception is a server bug. Strawberry logs it with its traceback,
+and its `MaskErrors` extension replaces the client-facing message with
+`"Unexpected error."`, so internal details are not exposed. Query validation
+errors (such as unknown fields) are not masked.
