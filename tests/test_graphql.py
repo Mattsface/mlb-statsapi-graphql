@@ -351,3 +351,210 @@ def test_types_module_does_not_import_resolvers():
         if isinstance(node, ast.ImportFrom) and node.module
     }
     assert not imported & {"resolvers", "schema", "app"}
+
+
+# M2.1: request-scoped DataLoaders.
+
+UPSTREAM_METHODS = ("get_team", "get_person", "get_team_roster")
+
+
+def upstream_calls(mlb) -> dict[str, int]:
+    """Count awaited calls per mocked AsyncMlb method, e.g. {"get_team": 1, ...}."""
+    return {method: getattr(mlb, method).await_count for method in UPSTREAM_METHODS}
+
+
+def team_model(id: int) -> Team:
+    return Team(id=id, link=f"/api/v1/teams/{id}", name=f"Team {id}", abbreviation=f"T{id}")
+
+
+ALIAS_ROSTER_QUERY = """{
+    first: team(id: 136) { name roster { player { fullName } } }
+    second: team(id: 136) { name roster { player { fullName } } }
+}"""
+
+
+@pytest.mark.parametrize("query, expected", [
+    # Counts before M2.1 (no DataLoaders) were 2/0/2, 0/2/0, 3/0/0, 2/0/0, 1/0/1.
+    (ALIAS_ROSTER_QUERY, {"get_team": 1, "get_person": 0, "get_team_roster": 1}),
+    ("{ a: player(id: 605141) { id } b: player(id: 605141) { fullName } }",
+     {"get_team": 0, "get_person": 1, "get_team_roster": 0}),
+    ("{ a: team(id: 136) { id } b: team(id: 136) { name } c: team(id: 136) { abbreviation } }",
+     {"get_team": 1, "get_person": 0, "get_team_roster": 0}),
+    ("{ a: team(id: 136) { id } b: team(id: 147) { id } }",
+     {"get_team": 2, "get_person": 0, "get_team_roster": 0}),
+    (ROSTER_QUERY, {"get_team": 1, "get_person": 0, "get_team_roster": 1}),
+])
+def test_upstream_call_counts(api, mlb, roster_player, query, expected):
+    mlb.get_team.side_effect = team_model
+    mlb.get_person.return_value = Person(id=605141, link="/x", fullName="Mookie Betts")
+    mlb.get_team_roster.return_value = [roster_player]
+    response = api.post("/graphql", json={"query": query})
+    assert "errors" not in response.json()
+    assert upstream_calls(mlb) == expected
+
+
+def test_team_aliases_share_team_and_roster_fetch(api, mlb, roster_player):
+    mlb.get_team_roster.return_value = [roster_player]
+    response = api.post("/graphql", json={"query": ALIAS_ROSTER_QUERY})
+    team = {"name": "Seattle Mariners", "roster": [{"player": {"fullName": "Mookie Betts"}}]}
+    assert response.json() == {"data": {"first": team, "second": team}}
+    mlb.get_team.assert_awaited_once_with(136)
+    mlb.get_team_roster.assert_awaited_once_with(136, rosterType="active")
+    mlb.get_person.assert_not_awaited()
+
+
+def test_player_aliases_share_one_fetch(api, mlb):
+    mlb.get_person.return_value = Person(id=605141, link="/x", fullName="Mookie Betts")
+    response = api.post("/graphql", json={
+        "query": "{ a: player(id: 605141) { id } b: player(id: 605141) { id fullName } }"
+    })
+    assert response.json() == {"data": {
+        "a": {"id": 605141}, "b": {"id": 605141, "fullName": "Mookie Betts"},
+    }}
+    mlb.get_person.assert_awaited_once_with(605141)
+
+
+def test_repeated_roster_on_one_team_shares_one_fetch(api, mlb, roster_player):
+    mlb.get_team_roster.return_value = [roster_player]
+    response = api.post("/graphql", json={"query": """{ team(id: 136) {
+        a: roster { player { id } }
+        b: roster { position { abbreviation } }
+    } }"""})
+    assert response.json() == {"data": {"team": {
+        "a": [{"player": {"id": 605141}}], "b": [{"position": {"abbreviation": "SS"}}],
+    }}}
+    mlb.get_team_roster.assert_awaited_once_with(136, rosterType="active")
+
+
+def test_separate_http_requests_do_not_share_cache(api, mlb):
+    for _ in range(2):
+        response = api.post("/graphql", json={"query": "{ team(id: 136) { id } }"})
+        assert response.json() == {"data": {"team": {"id": 136}}}
+    assert mlb.get_team.await_count == 2
+
+
+def test_each_request_gets_new_loaders(mlb):
+    from mlb_statsapi_graphql.context import Context
+
+    first, second = Context(mlb), Context(mlb)
+    assert first.loaders is not second.loaders
+    assert first.loaders.team is not second.loaders.team
+
+
+def test_different_ids_are_fetched_independently(api, mlb):
+    mlb.get_team.side_effect = team_model
+    response = api.post("/graphql", json={
+        "query": "{ a: team(id: 136) { id name } b: team(id: 147) { id name } }"
+    })
+    assert response.json() == {"data": {
+        "a": {"id": 136, "name": "Team 136"}, "b": {"id": 147, "name": "Team 147"},
+    }}
+    assert sorted(c.args for c in mlb.get_team.await_args_list) == [(136,), (147,)]
+
+
+def test_skipped_fields_do_not_fetch(api, mlb):
+    response = api.post("/graphql", json={"query": """{
+        a: team(id: 147) @skip(if: true) { id }
+        b: player(id: 605141) @include(if: false) { id }
+        c: team(id: 136) { id roster @skip(if: true) { player { id } } }
+    }"""})
+    assert response.json() == {"data": {"c": {"id": 136}}}
+    assert upstream_calls(mlb) == {"get_team": 1, "get_person": 0, "get_team_roster": 0}
+    mlb.get_team.assert_awaited_once_with(136)
+
+
+def test_missing_entities_are_null_for_every_alias(api, mlb):
+    mlb.get_team.return_value = None
+    mlb.get_person.return_value = None
+    response = api.post("/graphql", json={"query": """{
+        a: team(id: 999999) { roster { player { id } } } b: team(id: 999999) { id }
+        c: player(id: 999999) { id } d: player(id: 999999) { id }
+    }"""})
+    assert response.json() == {"data": {"a": None, "b": None, "c": None, "d": None}}
+    assert upstream_calls(mlb) == {"get_team": 1, "get_person": 1, "get_team_roster": 0}
+
+
+def test_empty_roster_is_shared_by_aliases(api, mlb):
+    mlb.get_team_roster.return_value = []
+    response = api.post("/graphql", json={"query": ALIAS_ROSTER_QUERY})
+    team = {"name": "Seattle Mariners", "roster": []}
+    assert response.json() == {"data": {"first": team, "second": team}}
+    mlb.get_team_roster.assert_awaited_once()
+
+
+@pytest.mark.parametrize("method, query, data, paths", [
+    ("get_team", "{ a: team(id: 136) { id } b: team(id: 136) { id } }",
+     {"a": None, "b": None}, [["a"], ["b"]]),
+    ("get_person", "{ a: player(id: 605141) { id } b: player(id: 605141) { id } }",
+     {"a": None, "b": None}, [["a"], ["b"]]),
+    ("get_team_roster", ALIAS_ROSTER_QUERY,
+     {"first": {"name": "Seattle Mariners", "roster": None},
+      "second": {"name": "Seattle Mariners", "roster": None}},
+     [["first", "roster"], ["second", "roster"]]),
+])
+def test_upstream_error_is_reported_per_alias_not_cached_as_empty(
+    api, mlb, method, query, data, paths
+):
+    getattr(mlb, method).side_effect = MlbTimeoutError("private")
+    response = api.post("/graphql", json={"query": query})
+    body = response.json()
+    assert body["data"] == data
+    assert sorted(e["path"] for e in body["errors"]) == paths
+    assert {e["extensions"]["code"] for e in body["errors"]} == {"UPSTREAM_ERROR"}
+    assert "private" not in response.text
+    # The failure is shared within the request, so the upstream is called once.
+    assert getattr(mlb, method).await_count == 1
+
+
+def test_upstream_error_is_not_cached_across_requests(api, mlb):
+    mlb.get_team.side_effect = [MlbTimeoutError("private"), team_model(136)]
+    first = api.post("/graphql", json={"query": "{ team(id: 136) { id } }"}).json()
+    assert first["errors"][0]["extensions"] == {"code": "UPSTREAM_ERROR"}
+    second = api.post("/graphql", json={"query": "{ team(id: 136) { id } }"}).json()
+    assert second == {"data": {"team": {"id": 136}}}
+    assert mlb.get_team.await_count == 2
+
+
+def test_failure_for_one_id_does_not_affect_another(api, mlb):
+    def get_team(id):
+        if id == 147:
+            raise MlbHttpError(503, "private")
+        return team_model(id)
+
+    mlb.get_team.side_effect = get_team
+    response = api.post("/graphql", json={
+        "query": "{ good: team(id: 136) { id } bad: team(id: 147) { id } }"
+    })
+    body = response.json()
+    assert body["data"] == {"good": {"id": 136}, "bad": None}
+    assert [(e["path"], e["extensions"]["code"]) for e in body["errors"]] == [
+        (["bad"], "UPSTREAM_ERROR")
+    ]
+
+
+def test_unexpected_exception_is_sanitized_for_every_alias(api, mlb):
+    mlb.get_team.side_effect = RuntimeError("secret internal detail")
+    response = api.post("/graphql", json={"query": "{ a: team(id: 136) { id } b: team(id: 136) { id } }"})
+    body = response.json()
+    assert body["data"] == {"a": None, "b": None}
+    assert [e["message"] for e in body["errors"]] == ["Unexpected error."] * 2
+    assert "secret" not in response.text
+    mlb.get_team.assert_awaited_once_with(136)
+
+
+def test_invalid_id_alias_does_not_block_valid_alias(api, mlb):
+    response = api.post("/graphql", json={
+        "query": "{ bad: player(id: -5) { id } good: team(id: 136) { id } again: team(id: 136) { id } }"
+    })
+    body = response.json()
+    assert body["data"] == {"bad": None, "good": {"id": 136}, "again": {"id": 136}}
+    assert [e["extensions"]["code"] for e in body["errors"]] == ["BAD_USER_INPUT"]
+    assert upstream_calls(mlb) == {"get_team": 1, "get_person": 0, "get_team_roster": 0}
+
+
+def test_upstream_failure_is_logged_once_per_fetch(api, mlb, caplog):
+    mlb.get_team.side_effect = MlbTimeoutError("private")
+    api.post("/graphql", json={"query": "{ a: team(id: 136) { id } b: team(id: 136) { id } }"})
+    warnings = [r for r in caplog.records if r.getMessage() == "MLB team lookup failed for 136"]
+    assert len(warnings) == 1
+    assert isinstance(warnings[0].exc_info[1], MlbTimeoutError)

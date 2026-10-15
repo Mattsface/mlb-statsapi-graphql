@@ -5,17 +5,12 @@ field resolvers, such as Team.roster, live on their type so this module never
 imports resolvers.py.
 """
 
-import logging
-
 import strawberry
-from mlbstatsapi.exceptions import TheMlbStatsApiException
-from pydantic import ValidationError
 from strawberry.types import Info
 
 from .context import Context
 from .errors import upstream_error
-
-logger = logging.getLogger(__name__)
+from .loaders import UPSTREAM_EXCEPTIONS
 
 
 @strawberry.type
@@ -44,10 +39,10 @@ class Team:
     @strawberry.field
     async def roster(self, info: Info[Context, None]) -> list[RosterEntry] | None:
         # Runs only when roster is selected, after the team itself has resolved.
+        # Aliased selections of the same team share one loader call.
         try:
-            roster = await info.context.mlb.get_team_roster(self.id, rosterType="active")
-        except (TheMlbStatsApiException, ValidationError) as exc:
-            logger.warning("MLB roster lookup failed for team %s", self.id, exc_info=True)
+            roster = await info.context.loaders.active_roster.load(self.id)
+        except UPSTREAM_EXCEPTIONS as exc:
             raise upstream_error() from exc
 
         # The roster already contains person details; no get_person calls are needed.
