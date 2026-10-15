@@ -558,3 +558,311 @@ def test_upstream_failure_is_logged_once_per_fetch(api, mlb, caplog):
     warnings = [r for r in caplog.records if r.getMessage() == "MLB team lookup failed for 136"]
     assert len(warnings) == 1
     assert isinstance(warnings[0].exc_info[1], MlbTimeoutError)
+
+
+# M2.2: query depth, cost, alias, and token limits.
+
+COMPLEXITY_REJECTION = {"data": None, "errors": [{
+    "message": "Query cost exceeds the configured limit.",
+    "extensions": {"code": "QUERY_COMPLEXITY_LIMIT"},
+}]}
+NO_UPSTREAM_CALLS = {"get_team": 0, "get_person": 0, "get_team_roster": 0}
+
+
+def teams(count: int, fields: str = "id", first_id: int = 1, prefix: str = "t") -> str:
+    """Selections like `t0: team(id: 1) { id } t1: team(id: 2) { id } ...`."""
+    return " ".join(
+        f"{prefix}{i}: team(id: {first_id + i}) {{ {fields} }}" for i in range(count)
+    )
+
+
+def cost(query: str, variables: dict | None = None, operation_name: str | None = None):
+    from graphql import parse
+
+    from mlb_statsapi_graphql.complexity import estimate_cost
+    from mlb_statsapi_graphql.schema import schema
+
+    return estimate_cost(schema._schema, parse(query), operation_name, variables)
+
+
+@pytest.fixture
+def limited_api(mlb):
+    """Build a client whose schema uses custom limits."""
+    from mlb_statsapi_graphql.schema import create_schema
+    from mlb_statsapi_graphql.settings import Limits
+
+    def build(**limits):
+        app = create_app(mlb_factory=lambda: mlb, schema=create_schema(Limits(**limits)))
+        return TestClient(app)
+
+    return build
+
+
+@pytest.mark.parametrize("query, variables, expected", [
+    # Root lookups and nested rosters.
+    ("{ team(id: 136) { id name } }", None, 5),
+    ("{ player(id: 605141) { id fullName } }", None, 5),
+    (ROSTER_QUERY, None, 15),
+    ("{ __typename }", None, 0),
+    # Aliases: the same ID shares one DataLoader call, so it is charged once.
+    ("{ a: team(id: 136) { id } b: team(id: 136) { name } }", None, 5),
+    (ALIAS_ROSTER_QUERY, None, 15),
+    ("{ team(id: 136) { a: roster { player { id } } b: roster { position { abbreviation } } } }",
+     None, 15),
+    ("{ a: team(id: 136) { id } b: player(id: 136) { id } }", None, 10),
+    # Distinct IDs and rosters on different teams are charged separately.
+    ("{ a: team(id: 136) { id } b: team(id: 147) { id } }", None, 10),
+    ("{ a: team(id: 136) { roster { player { id } } } b: team(id: 147) { roster { player { id } } } }",
+     None, 30),
+    ("{ a: team(id: 136) { roster { player { id } } } b: team(id: 136) { id } }", None, 15),
+    # Fragments count exactly like the fields they contain.
+    ("{ ...Teams } fragment Teams on Query { a: team(id: 1) { id } b: team(id: 2) { id } }",
+     None, 10),
+    ("{ team(id: 136) { ...WithRoster } } fragment WithRoster on Team { roster { player { id } } }",
+     None, 15),
+    ("{ ... on Query { team(id: 136) { ... on Team { roster { player { id } } } } } }", None, 15),
+    ("{ ...A ...A } fragment A on Query { team(id: 136) { roster { player { id } } } }", None, 15),
+    # Invalid IDs never reach upstream but are still charged (an upper bound).
+    ("{ team(id: 0) { id } }", None, 5),
+    # @skip and @include, with literals and variables.
+    ("{ team(id: 136) @skip(if: true) { id } }", None, 0),
+    ("{ team(id: 136) @include(if: false) { id } }", None, 0),
+    ("{ team(id: 136) { id roster @skip(if: true) { player { id } } } }", None, 5),
+    ("query($s: Boolean!) { team(id: 136) { roster @skip(if: $s) { player { id } } } }",
+     {"s": True}, 5),
+    ("query($s: Boolean!) { team(id: 136) { roster @skip(if: $s) { player { id } } } }",
+     {"s": False}, 15),
+    ("query($i: Boolean = true) { ...F @include(if: $i) } fragment F on Query { team(id: 1) { id } }",
+     None, 5),
+    ("query($i: Boolean = true) { ...F @include(if: $i) } fragment F on Query { team(id: 1) { id } }",
+     {"i": False}, 0),
+    # Variable IDs are compared by value.
+    ("query($a: Int!, $b: Int!) { x: team(id: $a) { id } y: team(id: $b) { id } }",
+     {"a": 136, "b": 136}, 5),
+    ("query($a: Int!, $b: Int!) { x: team(id: $a) { id } y: team(id: $b) { id } }",
+     {"a": 136, "b": 147}, 10),
+    ("query($a: Int! = 136) { x: team(id: $a) { id } y: team(id: 136) { id } }", None, 5),
+])
+def test_estimated_cost(query, variables, expected):
+    assert cost(query, variables) == expected
+
+
+def test_only_the_selected_operation_is_costed():
+    document = f"query Cheap {{ team(id: 136) {{ id }} }} query Expensive {{ {teams(30)} }}"
+    assert cost(document, operation_name="Cheap") == 5
+    assert cost(document, operation_name="Expensive") == 150
+
+
+def test_cost_is_not_estimated_for_operations_that_cannot_execute():
+    # graphql-core rejects these itself before any resolver runs.
+    assert cost("query A { team(id: 1) { id } } query B { team(id: 2) { id } }") is None
+    assert cost("query($id: Int!) { team(id: $id) { id } }", {}) is None
+    assert cost("{ team(id: 1) { id } }", operation_name="Missing") is None
+
+
+@pytest.mark.parametrize("query", [
+    "{ team(id: 136) { id name abbreviation } }",
+    "{ player(id: 605141) { id fullName } }",
+    ROSTER_QUERY,
+    # Six teams with rosters cost exactly 90, within the default limit of 100.
+    "{ " + teams(6, "id roster { player { id fullName } position { abbreviation } }") + " }",
+    # Twenty distinct teams cost exactly 100; the limit is inclusive.
+    "{ " + teams(20) + " }",
+])
+def test_normal_queries_are_accepted(api, mlb, roster_player, query):
+    mlb.get_team.side_effect = team_model
+    mlb.get_person.return_value = Person(id=605141, link="/x", fullName="Mookie Betts")
+    mlb.get_team_roster.return_value = [roster_player]
+    body = api.post("/graphql", json={"query": query}).json()
+    assert "errors" not in body
+    assert all(value is not None for value in body["data"].values())
+
+
+@pytest.mark.parametrize("query", [
+    # Many aliases with distinct IDs: 21 teams cost 105.
+    "{ " + teams(21) + " }",
+    # Seven teams with rosters cost 105.
+    "{ " + teams(7, "roster { player { id } }") + " }",
+    # Distinct players amplify the same way.
+    "{ " + " ".join(f"p{i}: player(id: {i + 1}) {{ id }}" for i in range(21)) + " }",
+    # Fragments, inline fragments, and nested spreads cannot hide the cost.
+    "{ ...Many } fragment Many on Query { " + teams(21) + " }",
+    "{ ... on Query { ... on Query { " + teams(21) + " } } }",
+    "{ ...A ...B } fragment A on Query { " + teams(11) + " } fragment B on Query { "
+    + teams(10, first_id=100, prefix="u") + " }",
+    "{ " + teams(7, "...R") + " } fragment R on Team { roster { player { id } } }",
+])
+def test_expensive_queries_are_rejected_before_any_upstream_call(api, mlb, query):
+    response = api.post("/graphql", json={"query": query})
+    assert response.status_code == 200
+    assert response.json() == COMPLEXITY_REJECTION
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+def test_duplicate_aliases_are_charged_once(api, mlb, roster_player):
+    mlb.get_team_roster.return_value = [roster_player]
+    query = "{ " + " ".join(
+        f"t{i}: team(id: 136) {{ name roster {{ player {{ id }} }} }}" for i in range(25)
+    ) + " }"
+    body = api.post("/graphql", json={"query": query}).json()
+    assert "errors" not in body
+    assert len(body["data"]) == 25
+    assert upstream_calls(mlb) == {"get_team": 1, "get_person": 0, "get_team_roster": 1}
+
+
+def test_directive_variables_decide_whether_fields_are_charged(api, mlb):
+    mlb.get_team.side_effect = team_model
+    query = "query($all: Boolean!) { first: team(id: 1000) { id } ...Many @include(if: $all) }" \
+        " fragment Many on Query { " + teams(20) + " }"
+    small = api.post("/graphql", json={"query": query, "variables": {"all": False}}).json()
+    assert small == {"data": {"first": {"id": 1000}}}
+    assert upstream_calls(mlb) == {"get_team": 1, "get_person": 0, "get_team_roster": 0}
+
+    large = api.post("/graphql", json={"query": query, "variables": {"all": True}}).json()
+    assert large == COMPLEXITY_REJECTION
+    assert mlb.get_team.await_count == 1  # unchanged by the rejected request
+
+
+def test_variable_ids_are_deduplicated_like_dataloaders(api, mlb):
+    query = "query($a: Int!, $b: Int!) { x: team(id: $a) { id } y: team(id: $b) { id } }"
+    body = api.post("/graphql", json={"query": query, "variables": {"a": 136, "b": 136}}).json()
+    assert body == {"data": {"x": {"id": 136}, "y": {"id": 136}}}
+    mlb.get_team.assert_awaited_once_with(136)
+
+
+def test_unselected_operation_does_not_count(api, mlb):
+    document = f"query Cheap {{ team(id: 136) {{ id }} }} query Expensive {{ {teams(21)} }}"
+    cheap = api.post("/graphql", json={"query": document, "operationName": "Cheap"}).json()
+    assert cheap == {"data": {"team": {"id": 136}}}
+    expensive = api.post("/graphql", json={"query": document, "operationName": "Expensive"})
+    assert expensive.json() == COMPLEXITY_REJECTION
+    mlb.get_team.assert_awaited_once_with(136)
+
+
+def test_invalid_variables_keep_the_normal_error(api, mlb):
+    body = api.post("/graphql", json={
+        "query": "query($id: Int!) { team(id: $id) { id } }", "variables": {"id": "x"},
+    }).json()
+    assert body["data"] is None
+    assert "QUERY_COMPLEXITY_LIMIT" not in str(body)
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+def test_complexity_error_is_not_masked(api, mlb):
+    # A GraphQLError without an original exception keeps its message and code.
+    from mlb_statsapi_graphql.complexity import complexity_error
+    from mlb_statsapi_graphql.errors import should_mask_error
+
+    assert not should_mask_error(complexity_error())
+    body = api.post("/graphql", json={"query": "{ " + teams(21) + " }"}).json()
+    assert "Unexpected error." not in str(body)
+
+
+def test_cost_limit_is_configurable(limited_api, mlb):
+    with limited_api(max_cost=14) as client:
+        assert client.post("/graphql", json={"query": ROSTER_QUERY}).json() == COMPLEXITY_REJECTION
+        assert client.post("/graphql", json={"query": "{ team(id: 136) { id } }"}).json() == {
+            "data": {"team": {"id": 136}}
+        }
+    assert upstream_calls(mlb) == {"get_team": 1, "get_person": 0, "get_team_roster": 0}
+
+
+DEEP_QUERY = "{ team(id: 136) { a { b { c { d { e { f { g } } } } } } } }"
+
+
+def test_excessive_depth_is_rejected_before_execution(api, mlb):
+    body = api.post("/graphql", json={"query": DEEP_QUERY}).json()
+    assert body["data"] is None
+    assert "'anonymous' exceeds maximum operation depth of 6" in [e["message"] for e in body["errors"]]
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+@pytest.mark.parametrize("query", [
+    ROSTER_QUERY,
+    "{ team(id: 136) { ...R } } fragment R on Team { roster { ...P } } fragment P on RosterEntry { player { id } }",
+    "query Deep { a: team(id: 136) { b: roster { ... on RosterEntry { c: player { id } } } } }",
+])
+def test_depth_limit_applies_through_fragments_and_aliases(limited_api, mlb, query):
+    # The roster query is 3 levels deep: team -> roster -> player -> scalar.
+    with limited_api(max_depth=2) as client:
+        body = client.post("/graphql", json={"query": query}).json()
+    assert body["data"] is None
+    assert "exceeds maximum operation depth of 2" in body["errors"][0]["message"]
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+def test_roster_query_fits_a_depth_limit_of_three(limited_api, mlb, roster_player):
+    mlb.get_team_roster.return_value = [roster_player]
+    with limited_api(max_depth=3) as client:
+        body = client.post("/graphql", json={"query": ROSTER_QUERY}).json()
+    assert "errors" not in body
+
+
+def test_too_many_aliases_are_rejected(api, mlb):
+    query = "{ " + " ".join(f"a{i}: team(id: 136) {{ id }}" for i in range(31)) + " }"
+    body = api.post("/graphql", json={"query": query}).json()
+    assert body == {"data": None, "errors": [{"message": "31 aliases found. Allowed: 30"}]}
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+def test_aliases_in_fragments_are_counted(api, mlb):
+    query = "{ ...F } fragment F on Query { " + " ".join(
+        f"a{i}: __typename" for i in range(31)
+    ) + " }"
+    body = api.post("/graphql", json={"query": query}).json()
+    assert body["errors"][0]["message"] == "31 aliases found. Allowed: 30"
+
+
+def test_oversized_document_is_rejected_while_parsing(api, mlb):
+    query = "{ team(id: 136) { " + "id " * 1000 + "} }"
+    body = api.post("/graphql", json={"query": query}).json()
+    assert body["data"] is None
+    assert "more than 1000 tokens" in body["errors"][0]["message"]
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+@pytest.mark.parametrize("query", [
+    # Fragment cycles are rejected by standard validation, never walked forever.
+    "{ ...A } fragment A on Query { ...B } fragment B on Query { ...A }",
+    # Unknown fragments and fields.
+    "{ ...Missing }",
+    "{ team(id: 136) { roster { player { team { id } } } } }",
+    # Mutations do not exist.
+    "mutation { team(id: 136) { id } }",
+])
+def test_malformed_documents_make_no_upstream_calls(api, mlb, query):
+    response = api.post("/graphql", json={"query": query})
+    assert response.json()["errors"]
+    assert "QUERY_COMPLEXITY_LIMIT" not in response.text
+    assert upstream_calls(mlb) == NO_UPSTREAM_CALLS
+
+
+def test_introspection_is_within_limits(api):
+    # The same options GraphiQL uses for its schema explorer.
+    from graphql import get_introspection_query
+
+    query = get_introspection_query(
+        descriptions=True, specified_by_url=True, directive_is_repeatable=True,
+        schema_description=True, input_value_deprecation=True,
+    )
+    body = api.post("/graphql", json={"query": query}).json()
+    assert "errors" not in body
+    assert body["data"]["__schema"]["queryType"] == {"name": "Query", "kind": "OBJECT"}
+
+
+def test_default_limits():
+    from mlb_statsapi_graphql.settings import Limits
+
+    assert Limits() == Limits(max_depth=6, max_cost=100, max_aliases=30, max_tokens=1000)
+    assert Limits.from_env({}) == Limits()
+
+
+def test_limits_from_environment():
+    from mlb_statsapi_graphql.settings import Limits
+
+    assert Limits.from_env({"MLB_GRAPHQL_MAX_COST": "150", "MLB_GRAPHQL_MAX_DEPTH": "4"}) == Limits(
+        max_cost=150, max_depth=4
+    )
+    for raw in ("abc", "0", "-5", "1.5"):
+        with pytest.raises(ValueError, match="MLB_GRAPHQL_MAX_TOKENS"):
+            Limits.from_env({"MLB_GRAPHQL_MAX_TOKENS": raw})

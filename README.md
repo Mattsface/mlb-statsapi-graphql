@@ -87,6 +87,8 @@ The package lives in `src/mlb_statsapi_graphql/`:
   model to the public GraphQL `Team` in `types.py`.
 - `types.py` defines the GraphQL types, including the lazy `Team.roster` field
   resolver. `errors.py` holds the shared client-safe errors.
+- `settings.py` holds the resource limits and `complexity.py` the query cost
+  estimate (see M2.2 below).
 
 Imports flow one way: `app → schema → resolvers → types → errors/context → loaders`.
 `types.py` never imports `resolvers.py`, so there is no circular import.
@@ -121,9 +123,11 @@ the same test command on Python 3.12 for pull requests and pushes to `main`.
 - **M1:** Players, rosters, nested relationships.
 - **M2:** Pagination, batching, caching, and query complexity.
   - **M2.1:** Request-scoped caching with DataLoaders (below).
+  - **M2.2:** Query depth, cost, alias, and document-size limits (below).
+  - **M2.3 (planned):** Bounded upstream concurrency and observability.
 
-This service is intended for local development. GraphiQL is enabled; query
-complexity controls are deferred to later milestones.
+This service is intended for local development. GraphiQL is enabled, and the
+M2.2 limits leave it and normal introspection fully usable.
 
 ## M1: players and nested rosters
 
@@ -400,3 +404,193 @@ Errors are unchanged from M1.1:
   be a separate, later decision.
 - Upstream call counts are verified in tests with mocks; there is no runtime
   request-count metric.
+
+## M2.2: query complexity and resource protection
+
+DataLoaders stop a request from fetching the *same* entity twice, but nothing
+in M2.1 stops a client from asking for *many different* entities. GraphQL
+aliases make that easy, because one field can be selected any number of times
+under different names:
+
+```graphql
+query {
+  a: team(id: 108) { roster { player { fullName } } }
+  b: team(id: 109) { roster { player { fullName } } }
+  c: team(id: 110) { roster { player { fullName } } }
+  # ...one line per MLB team
+}
+```
+
+Thirty lines like these turn one small HTTP request into 60 upstream MLB
+requests. M2.2 adds four checks that reject such operations **before any
+resolver runs**, so a rejected operation makes zero MLB calls.
+
+### The four checks
+
+A request passes through them in this order:
+
+| Check | Default | Runs during | Implemented by |
+| --- | --- | --- | --- |
+| Document tokens | 1000 | parsing | Strawberry `MaxTokensLimiter` (graphql-core parser `max_tokens`) |
+| Query depth | 6 | validation | Strawberry `QueryDepthLimiter` |
+| Aliases | 30 | validation | Strawberry `MaxAliasesLimiter` |
+| Query cost | 100 | after validation, before execution | `complexity.py` (`QueryCostLimiter`) |
+
+The first three are Strawberry's built-in security extensions; only the cost
+check is project code, because cost depends on what each field does upstream.
+All four are configured in `schema.py:create_schema`.
+
+**Tokens** are lexical units: names, punctuation such as `{` `}` `(` `)` `:`,
+and values. The parser stops as soon as the limit is passed, so an enormous
+document costs no more than 1000 tokens of work to reject. A full
+introspection query, like the one GraphiQL sends, is roughly 200 tokens.
+
+**Depth** is the number of nested selection sets below the root, as measured by
+Strawberry: `{ team(id: 136) { id } }` has depth 1, and the roster query
+`team → roster → player → fullName` has depth 3, the deepest valid query in
+today's schema. Fragments and inline fragments are expanded and do not add a
+level; aliases do not change depth. Introspection fields (`__schema`, `__type`)
+are ignored, so GraphiQL keeps working. Because the current schema has no
+cycles, the depth limit is mostly a guard for future relationships (for
+example, a `Player.team` field would make `team → roster → player → team → ...`
+possible) and for rejecting deeply nested junk cheaply.
+
+**Aliases** are counted across the whole document, including fragments and
+unselected operations. 30 is generous for hand-written queries; the alias and
+token limits mainly bound response size for selections that are free upstream
+(such as hundreds of aliased `__typename` fields).
+
+### Query cost
+
+Cost is a relative weight for upstream work, not milliseconds and not an exact
+HTTP request count:
+
+| GraphQL field | Cost | Upstream call |
+| --- | --- | --- |
+| Root `team(id:)` | 5 | `get_team(id)` |
+| Root `player(id:)` | 5 | `get_person(id)` |
+| `Team.roster` | 10 | `get_team_roster(id)` |
+| Everything else (scalars, roster entries, introspection) | 0 | none |
+
+The roster weight is higher because a roster response is much larger than a
+single team. Roster `player` and `position` fields are free: their data
+arrives with the roster.
+
+The estimate mirrors the request-scoped DataLoaders:
+
+- Each **distinct** `team` ID and each **distinct** `player` ID is charged once.
+  Two aliases of `team(id: 136)` cost 5, not 10, because the second load is
+  served from the DataLoader cache.
+- Each distinct team whose `roster` is selected adds 10, however many aliased
+  `roster` selections it has. Rosters on *different* teams are charged
+  separately.
+- IDs from variables are compared by their values, so `team(id: $a)` and
+  `team(id: $b)` with `a = b = 136` cost 5.
+
+`complexity.py` walks the selections the way execution would:
+
+- Only the operation that will run is costed (`operationName` selects it);
+  other operations in the same document are ignored.
+- Named fragments and inline fragments are expanded, so moving fields into a
+  fragment never reduces cost.
+- `@skip(if:)` and `@include(if:)` are evaluated with the request's variables
+  (including defaults); skipped fields cost nothing.
+- If variables cannot be coerced, or the operation is missing or ambiguous,
+  no estimate is made: graphql-core rejects the request itself before running
+  any resolver.
+
+An operation whose cost is greater than the limit (the limit itself is
+allowed) is rejected with HTTP 200, like other GraphQL errors:
+
+```json
+{
+  "data": null,
+  "errors": [
+    {
+      "message": "Query cost exceeds the configured limit.",
+      "extensions": {"code": "QUERY_COMPLEXITY_LIMIT"}
+    }
+  ]
+}
+```
+
+The rejection is a plain `GraphQLError` with no original exception, so
+`MaskErrors` never turns it into `"Unexpected error."`. The check sets
+Strawberry's `execution_context.result` before execution starts, which makes
+Strawberry skip execution entirely.
+
+### Examples with the default limits
+
+| Operation | Cost | Result |
+| --- | --- | --- |
+| `{ team(id: 136) { id name } }` | 5 | accepted |
+| `{ player(id: 605141) { fullName } }` | 5 | accepted |
+| One team with `roster` | 5 + 10 = 15 | accepted |
+| 25 aliases of `team(id: 136)` with `roster` | 15 | accepted (1 team + 1 roster call) |
+| Six teams with rosters | 6 × 15 = 90 | accepted |
+| 20 distinct teams | 100 | accepted |
+| 21 distinct teams | 105 | rejected, `QUERY_COMPLEXITY_LIMIT` |
+| Seven teams with rosters | 105 | rejected |
+| 31 aliases of anything | – | rejected, `31 aliases found. Allowed: 30` |
+| A document with more than 1000 tokens | – | rejected, `Syntax Error: Document contains more than 1000 tokens...` |
+
+Depth, alias, and token errors use Strawberry's messages and are returned as
+ordinary GraphQL validation or syntax errors with `data: null`.
+
+### Configuration
+
+Defaults live in `settings.py` (`Limits`). Each can be overridden with an
+environment variable read once at startup; values must be positive integers:
+
+| Variable | Default |
+| --- | --- |
+| `MLB_GRAPHQL_MAX_DEPTH` | 6 |
+| `MLB_GRAPHQL_MAX_COST` | 100 |
+| `MLB_GRAPHQL_MAX_ALIASES` | 30 |
+| `MLB_GRAPHQL_MAX_TOKENS` | 1000 |
+
+```bash
+MLB_GRAPHQL_MAX_COST=150 uv run uvicorn mlb_statsapi_graphql.app:app --reload
+```
+
+Field weights (`ROOT_FIELD_COSTS`, `ROSTER_COST`) are constants in
+`complexity.py`. Tests build apps with custom limits through
+`create_app(schema=create_schema(Limits(...)))`.
+
+### Limitations of the cost model
+
+The estimate is a deliberately simple upper bound, so it can overcharge:
+
+- An invalid ID (`team(id: 0)`) is charged even though it is rejected without
+  an upstream call.
+- A roster is charged even if its team turns out not to exist, in which case
+  the roster resolver never runs.
+- If an ID's value cannot be determined before execution, it is charged as a
+  new, distinct entity.
+- A `team` and a `player` with the same number are different upstream
+  entities, so both are charged.
+
+It never undercharges what the schema can do today, but it is tied to this
+schema: a new field that calls upstream must be added to `complexity.py`, or
+it will be treated as free. The walker ignores fragment type conditions, which
+is correct only because the schema has no interfaces or unions. The depth and
+alias limits count every operation in the document, while cost counts only the
+selected one.
+
+Upstream payload sizes also vary (an off-season roster may be empty), so
+equal costs do not mean equal latency.
+
+### What these limits do not do
+
+The checks bound the work of a **single** request. They do not limit how many
+requests a client sends, how many upstream calls run at once across all
+requests, or how long MLB takes to answer. A client can still send many
+accepted requests per second, each costing 100. Protecting the upstream service
+and this process under load needs:
+
+- bounded upstream concurrency (planned for M2.3),
+- per-client rate limiting, usually at a gateway or proxy,
+- timeouts and observability to see what is actually expensive (M2.3).
+
+Cost limits make each request predictable; those controls make the *total*
+predictable.

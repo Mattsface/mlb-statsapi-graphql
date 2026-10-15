@@ -3,15 +3,19 @@
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
+import strawberry
 from fastapi import FastAPI, Request
 from mlbstatsapi import AsyncMlb
 from strawberry.fastapi import GraphQLRouter
 
 from .context import Context
-from .schema import schema
+from .schema import schema as default_schema
 
 
-def create_app(mlb_factory: Callable[[], AsyncMlb] = AsyncMlb) -> FastAPI:
+def create_app(
+    mlb_factory: Callable[[], AsyncMlb] = AsyncMlb,
+    schema: strawberry.Schema = default_schema,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async with mlb_factory() as mlb:
