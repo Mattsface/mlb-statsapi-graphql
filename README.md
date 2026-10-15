@@ -6,6 +6,8 @@ A lightweight Python service that exposes selected MLB Stats API data through [G
 
 Instead of building separate REST calls for a team and its active roster, request only the fields you need in a single GraphQL operation. The service resolves those fields through the existing Python library; it is **not** a replacement for or fork of that library.
 
+![Baseball stadium — MLB Stats API project](https://user-images.githubusercontent.com/2068393/203456246-dfdbdf0f-1e43-4329-aaa9-1c4008f9800d.jpg)
+
 ## Current capabilities
 
 - **Team lookup** by MLB team ID: `id`, `name`, and `abbreviation`
