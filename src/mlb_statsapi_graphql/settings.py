@@ -39,3 +39,25 @@ class Limits:
                 raise ValueError(f"{variable} must be at least 1, got {value}")
             values[name] = value
         return cls(**values)
+
+
+@dataclass(frozen=True)
+class UpstreamSettings:
+    max_concurrency: int = 10
+
+    def __post_init__(self) -> None:
+        if type(self.max_concurrency) is not int or self.max_concurrency < 1:
+            raise ValueError("MLB_GRAPHQL_MAX_CONCURRENCY must be a positive integer")
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] = os.environ) -> "UpstreamSettings":
+        raw = environ.get("MLB_GRAPHQL_MAX_CONCURRENCY")
+        if raw is None:
+            return cls()
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(
+                "MLB_GRAPHQL_MAX_CONCURRENCY must be a positive integer"
+            ) from None
+        return cls(max_concurrency=value)
