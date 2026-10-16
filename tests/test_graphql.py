@@ -436,7 +436,10 @@ def test_separate_http_requests_do_not_share_cache(api, mlb):
 def test_each_request_gets_new_loaders(mlb):
     from mlb_statsapi_graphql.context import Context
 
-    first, second = Context(mlb), Context(mlb)
+    import asyncio
+
+    semaphore = asyncio.Semaphore(10)
+    first, second = Context(mlb, semaphore), Context(mlb, semaphore)
     assert first.loaders is not second.loaders
     assert first.loaders.team is not second.loaders.team
 

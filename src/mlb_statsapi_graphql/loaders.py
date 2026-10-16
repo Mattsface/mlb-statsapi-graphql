@@ -7,8 +7,8 @@ aliased selections share one upstream call.
 
 This is caching and deduplication, not backend batching: the upstream methods
 used here fetch one entity per HTTP request, so a batch of distinct keys is
-still one concurrent upstream call per key. See the README for why the
-library's bulk people endpoint is not used.
+still one logical lookup per key, admitted through the shared semaphore.
+True backend batching remains outside this milestone.
 """
 
 import asyncio
@@ -21,6 +21,8 @@ from mlbstatsapi.models.people import Person, Player
 from mlbstatsapi.models.teams import Team
 from pydantic import ValidationError
 from strawberry.dataloader import DataLoader
+
+from .upstream import RequestLookups
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +48,21 @@ async def _fetch_each[K, V](
 
 
 class Loaders:
-    def __init__(self, mlb: AsyncMlb) -> None:
+    def __init__(self, mlb: AsyncMlb, lookups: RequestLookups) -> None:
         self.team: DataLoader[int, Team | None] = DataLoader(
-            lambda ids: _fetch_each(ids, mlb.get_team, "team")
+            lambda ids: _fetch_each(
+                ids, lambda id: lookups.run("team", lambda: mlb.get_team(id)), "team"
+            )
         )
         self.person: DataLoader[int, Person | None] = DataLoader(
-            lambda ids: _fetch_each(ids, mlb.get_person, "player")
+            lambda ids: _fetch_each(
+                ids, lambda id: lookups.run("person", lambda: mlb.get_person(id)), "player"
+            )
         )
         self.active_roster: DataLoader[int, list[Player]] = DataLoader(
             lambda ids: _fetch_each(
-                ids, lambda id: mlb.get_team_roster(id, rosterType="active"), "roster"
+                ids, lambda id: lookups.run(
+                    "roster", lambda: mlb.get_team_roster(id, rosterType="active")
+                ), "roster"
             )
         )

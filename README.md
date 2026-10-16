@@ -15,10 +15,11 @@ Instead of building separate REST calls for a team and its active roster, reques
 - **Active team rosters** with nested player and position fields, loaded only when requested
 - **Async upstream access** with a shared per-process `AsyncMlb` client and HTTP connection pool
 - **Request-scoped DataLoaders** that deduplicate repeated team, person, and active-roster lookups
+- **Shared upstream concurrency cap** with request-local timing and structured server logs
 - **Query safeguards** for depth, cost, aliases, and document size
 - **Client-safe GraphQL errors** and an offline test suite
 
-**Not included yet:** authentication, deployment configuration, rate limiting, bounded upstream concurrency, production metrics, mutations, historical rosters, or a comprehensive MLB GraphQL schema.
+**Not included yet:** authentication, deployment configuration, rate limiting, production metrics, mutations, historical rosters, or a comprehensive MLB GraphQL schema.
 
 ## Quick start
 
@@ -93,6 +94,9 @@ FastAPI / Strawberry
 Request context + per-request DataLoaders
       |
       v
+Shared concurrency semaphore (per application worker)
+      |
+      v
 Shared AsyncMlb client (per application worker)
       |
       v
@@ -113,6 +117,7 @@ Defaults are intentionally simple and configurable:
 | Maximum estimated query cost | 100 | `MLB_GRAPHQL_MAX_COST` |
 | Maximum aliases | 30 | `MLB_GRAPHQL_MAX_ALIASES` |
 | Maximum document tokens | 1,000 | `MLB_GRAPHQL_MAX_TOKENS` |
+| Maximum concurrent upstream lookups per worker | 10 | `MLB_GRAPHQL_MAX_CONCURRENCY` |
 
 The cost estimator currently charges **5** per distinct root team or person lookup and **10** per distinct requested team roster. These are relative weights, **not** exact request counts or latency predictions. Duplicate selections of the same ID are counted once to reflect DataLoader caching.
 
@@ -122,7 +127,71 @@ Example override:
 MLB_GRAPHQL_MAX_COST=150 uv run uvicorn mlb_statsapi_graphql.app:app --reload
 ```
 
-These controls limit individual operations; they do **not** provide rate limiting or enforce an application-wide limit on concurrent upstream calls.
+All environment limits must be positive integers; invalid concurrency configuration
+fails when the application is created. For example:
+
+```bash
+MLB_GRAPHQL_MAX_CONCURRENCY=5 uv run uvicorn mlb_statsapi_graphql.app:app --reload
+```
+
+The concurrency default of **10** is a modest starting point for this educational
+service, allowing several independent lookups while reducing bursts. It is not a
+benchmark-derived capacity or an MLB quota. Tune it for your workload.
+
+One **semaphore** (a fixed pool of permits) is created during FastAPI lifespan.
+Team, person, and active-roster lookups all acquire from that same pool across
+requests. A permit is held through the entire library method, including retries,
+backoff, and parsing, and released on success, failure, or cancellation. Request
+cleanup cancels and awaits unfinished DataLoader lookups before logging totals.
+The shared `AsyncMlb` client retains its existing ownership, retry, timeout, and
+cleanup behavior.
+
+### Request observations
+
+Each request has fresh statistics and a generated `request_id`. The
+`mlb_statsapi_graphql.upstream` logger emits JSON message bodies at **INFO** level,
+with the same fields attached to Python logging records for custom formatters.
+Enable that logger and attach an INFO-capable handler in your application's
+logging configuration; Uvicorn's default logging configuration alone does not
+enable these application INFO records. For local development, a launcher can use:
+
+```python
+import logging
+import uvicorn
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+uvicorn.run("mlb_statsapi_graphql.app:app")
+```
+
+No metrics service or global logging configuration is added by this package.
+Records contain no query text, upstream response bodies, or exception messages.
+Existing server-side error traceback logs remain available.
+
+| Event / field | Definition |
+| --- | --- |
+| `mlb_upstream_lookup` | One completed or cancelled logical lookup, with `request_id`, `lookup_kind` (`team`, `person`, `roster`), `admitted`, and `outcome` (`success`, `error`, `cancelled`) |
+| `queue_wait_seconds` | Time from reaching admission to acquiring a permit; for cancellation while waiting, time spent waiting until cancellation |
+| `lookup_seconds` | Time after admission until the library method returns, raises, or is cancelled; includes library retries, retry delays, JSON decoding, and model parsing |
+| `mlb_graphql_request` | Request cleanup summary with the same `request_id` |
+| `lookup_count` | Logical lookups admitted for this request, including admitted failures and cancellations; **not HTTP attempts** |
+| `error_count` | Admitted library calls that raised an exception, including unexpected exceptions |
+| `cancellation_count` | Lookups cancelled while waiting or running; waiting cancellations do not increment `lookup_count` |
+
+The summary's timing fields sum the per-lookup intervals. They use a **monotonic
+clock**, which cannot jump when wall-clock time is adjusted. Overlapping lookups
+mean summed durations are not request latency. Cache hits add no lookup or timing;
+missing entities still count as successful lookups. Requests rejected before
+execution report zero lookups and zero timing. Request IDs correlate records,
+without sharing counters or cached data across requests.
+
+The cap is **per application worker**: four workers configured with 10 permits can
+admit up to 40 logical lookups. It is not rate limiting. Waiting work is **not
+bounded**, so a backlog can still consume memory and increase latency. Existing
+HTTP timeouts apply to transport phases/attempts, not to queue wait plus retries
+and execution as an overall request deadline. Cancellation cleanup applies when
+the server cancels execution; a client disconnect does not necessarily cause that.
+Batching, shared caches, dashboards, and transport-level attempt instrumentation
+remain outside this milestone.
 
 ### Error behavior
 
@@ -155,6 +224,7 @@ Tests mock the upstream `AsyncMlb` client; they do not require live MLB API acce
 | `resolvers.py` | Root query resolution |
 | `context.py` / `loaders.py` | Request context and DataLoader caching |
 | `complexity.py` / `settings.py` | Query cost estimation and configurable limits |
+| `upstream.py` | Shared admission, request statistics, and structured lookup logs |
 | `errors.py` | Shared client-safe error helpers |
 
 Source files live under `src/mlb_statsapi_graphql/`; tests live under `tests/`.
@@ -166,7 +236,7 @@ Source files live under `src/mlb_statsapi_graphql/`; tests live under `tests/`.
 - [x] **M1.1** — Input validation and error handling cleanup
 - [x] **M2.1** — Request-scoped DataLoader caching
 - [x] **M2.2** — Query depth, cost, alias, and token limits
-- [ ] **M2.3** — Bounded upstream concurrency and observability
+- [x] **M2.3** — Bounded upstream concurrency and observability
 - [ ] **Future** — Assess broader queries, real batching where safe, operational hardening, and deployment
 
 Roadmap items are goals, not delivery commitments. The project is evolving and breaking changes remain possible.
